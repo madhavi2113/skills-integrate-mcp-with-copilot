@@ -5,14 +5,101 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel
+from typing import Optional
+import time
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
-              description="API for viewing and signing up for extracurricular activities")
+              description="API for viewing and signing up for extracurricular activities with authentication and profiles.")
+# In-memory user database
+users = {}
+# Example: users = {"michael@mergington.edu": {"name": "Michael", "email": ..., "hashed_password": ..., "year": 11}}
+
+# JWT and password hashing setup
+SECRET_KEY = "supersecretkey"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_SECONDS = 3600
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+    year: int
+
+class UserProfile(BaseModel):
+    name: str
+    email: str
+    year: int
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[int] = None):
+    to_encode = data.copy()
+    expire = int(time.time()) + (expires_delta or ACCESS_TOKEN_EXPIRE_SECONDS)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None or email not in users:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    return users[email]
+# In-memory activity database
+
+# --- AUTH & PROFILE ENDPOINTS ---
+@app.post("/auth/signup", status_code=201)
+def signup(user: UserCreate):
+    if user.email in users:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    users[user.email] = {
+        "name": user.name,
+        "email": user.email,
+        "hashed_password": get_password_hash(user.password),
+        "year": user.year
+    }
+    return {"message": "User registered successfully"}
+
+@app.post("/auth/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = users.get(form_data.username)
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+    access_token = create_access_token(data={"sub": user["email"]})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/auth/profile", response_model=UserProfile)
+def get_profile(current_user: dict = Depends(get_current_user)):
+    return {"name": current_user["name"], "email": current_user["email"], "year": current_user["year"]}
+
+@app.put("/auth/profile", response_model=UserProfile)
+def update_profile(profile: UserProfile, current_user: dict = Depends(get_current_user)):
+    user = users.get(current_user["email"])
+    user["name"] = profile.name
+    user["year"] = profile.year
+    return {"name": user["name"], "email": user["email"], "year": user["year"]}
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -88,45 +175,31 @@ def get_activities():
     return activities
 
 
+
+# Now requires authentication; email is taken from token
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
-    # Validate activity exists
+def signup_for_activity(activity_name: str, current_user: dict = Depends(get_current_user)):
+    """Sign up the current user for an activity"""
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
     activity = activities[activity_name]
-
-    # Validate student is not already signed up
+    email = current_user["email"]
     if email in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is already signed up"
-        )
-
-    # Add student
+        raise HTTPException(status_code=400, detail="Student is already signed up")
     activity["participants"].append(email)
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
+
+# Now requires authentication; email is taken from token
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
-    # Validate activity exists
+def unregister_from_activity(activity_name: str, current_user: dict = Depends(get_current_user)):
+    """Unregister the current user from an activity"""
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
     activity = activities[activity_name]
-
-    # Validate student is signed up
+    email = current_user["email"]
     if email not in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is not signed up for this activity"
-        )
-
-    # Remove student
+        raise HTTPException(status_code=400, detail="Student is not signed up for this activity")
     activity["participants"].remove(email)
     return {"message": f"Unregistered {email} from {activity_name}"}
